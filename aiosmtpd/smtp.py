@@ -96,6 +96,8 @@ class SMTP(asyncio.StreamReaderProtocol):
         self.auth_method = auth_method
         self.authenticated = False
         self.auth_required = auth_required
+        self.auth_user = None
+        self.auth_passwd = None
         self.command_size_limits.clear()
         if hostname:
             self.hostname = hostname
@@ -479,6 +481,8 @@ class SMTP(asyncio.StreamReaderProtocol):
                     return
             if self.auth_method(login, password):
                 self.authenticated = True
+                self.auth_user = login
+                self.auth_passwd = password
                 status = '235 Authentication successful'
             else:
                 status = '535 Authentication credentials invalid'
