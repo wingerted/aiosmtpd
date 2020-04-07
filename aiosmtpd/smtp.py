@@ -427,7 +427,8 @@ class SMTP(asyncio.StreamReaderProtocol):
         self.transport = self._tls_protocol._app_transport
         self._tls_protocol.connection_made(self._original_transport)
 
-    def smtp_AUTH(self, arg):
+    @syntax('AUTH PLAIN')
+    async def smtp_AUTH(self, arg):
         if not self.session.host_name:
             await self.push('503 Error: send EHLO first')
             return
@@ -523,6 +524,10 @@ class SMTP(asyncio.StreamReaderProtocol):
 
     @syntax('HELP [command]')
     async def smtp_HELP(self, arg):
+        if self.auth_required and not self.authenticated:
+            log.info('Authentication required')
+            await self.push('530 Authentication required')
+            return
         code = 250
         if arg:
             method = getattr(self, 'smtp_' + arg.upper(), None)

@@ -323,8 +323,8 @@ class TestSMTP(unittest.TestCase):
             code, response = client.docmd('HELP')
             self.assertEqual(code, 250)
             self.assertEqual(response,
-                             b'Supported commands: DATA EHLO HELO HELP MAIL '
-                             b'NOOP QUIT RCPT RSET VRFY AUTH')
+                             b'Supported commands: AUTH DATA EHLO HELO HELP MAIL '
+                             b'NOOP QUIT RCPT RSET VRFY')
 
     def test_help_helo(self):
         with SMTP(*self.address) as client:
@@ -416,8 +416,8 @@ class TestSMTP(unittest.TestCase):
             code, response = client.docmd('HELP me!')
             self.assertEqual(code, 501)
             self.assertEqual(response,
-                             b'Supported commands: DATA EHLO HELO HELP MAIL '
-                             b'NOOP QUIT RCPT RSET VRFY AUTH')
+                             b'Supported commands: AUTH DATA EHLO HELO HELP MAIL '
+                             b'NOOP QUIT RCPT RSET VRFY')
 
     def test_expn(self):
         with SMTP(*self.address) as client:
@@ -904,8 +904,8 @@ class TestRequiredAuthentication(unittest.TestCase):
             code, response = client.docmd('HELP')
             self.assertEqual(code, 250)
             self.assertEqual(response,
-                             b'Supported commands: EHLO HELO MAIL RCPT '
-                             b'DATA RSET NOOP QUIT VRFY AUTH')
+                             b'Supported commands: AUTH DATA EHLO HELO HELP MAIL '
+                             b'NOOP QUIT RCPT RSET VRFY')
 
     def test_vrfy_authenticated(self):
         with SMTP(*self.address) as client:
