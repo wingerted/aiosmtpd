@@ -9,6 +9,7 @@ from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Sink
 from aiosmtpd.smtp import SMTP as Server, __ident__ as GREETING
 from aiosmtpd.testing.helpers import reset_connection
+from base64 import b64encode
 from contextlib import ExitStack
 from smtplib import (
     SMTP, SMTPDataError, SMTPResponseException, SMTPServerDisconnected)
@@ -18,9 +19,17 @@ CRLF = '\r\n'
 BCRLF = b'\r\n'
 
 
+def authenticator(login, password):
+    if login and login.decode() == 'goodlogin':
+        return True
+    else:
+        return False
+
+
 class DecodingController(Controller):
     def factory(self):
-        return Server(self.handler, decode_data=True, enable_SMTPUTF8=True)
+        return Server(self.handler, decode_data=True, enable_SMTPUTF8=True,
+                      auth_require_tls=False, auth_method=authenticator)
 
 
 class NoDecodeController(Controller):
@@ -31,6 +40,13 @@ class NoDecodeController(Controller):
 class TimeoutController(Controller):
     def factory(self):
         return Server(self.handler, timeout=0.1)
+
+
+class RequiredAuthDecodingController(Controller):
+    def factory(self):
+        return Server(self.handler, decode_data=True, enable_SMTPUTF8=True,
+                      auth_require_tls=False, auth_method=authenticator,
+                      auth_required=True)
 
 
 class ReceivingHandler:
@@ -246,7 +262,8 @@ class TestSMTP(unittest.TestCase):
             self.assertEqual(lines[0], bytes(socket.getfqdn(), 'utf-8'))
             self.assertEqual(lines[1], b'SIZE 33554432')
             self.assertEqual(lines[2], b'SMTPUTF8')
-            self.assertEqual(lines[3], b'HELP')
+            self.assertEqual(lines[3], b'AUTH PLAIN')
+            self.assertEqual(lines[4], b'HELP')
 
     def test_ehlo_duplicate(self):
         with SMTP(*self.address) as client:
@@ -307,7 +324,7 @@ class TestSMTP(unittest.TestCase):
             self.assertEqual(code, 250)
             self.assertEqual(response,
                              b'Supported commands: DATA EHLO HELO HELP MAIL '
-                             b'NOOP QUIT RCPT RSET VRFY')
+                             b'NOOP QUIT RCPT RSET VRFY AUTH')
 
     def test_help_helo(self):
         with SMTP(*self.address) as client:
@@ -387,6 +404,12 @@ class TestSMTP(unittest.TestCase):
             self.assertEqual(code, 250)
             self.assertEqual(response, b'Syntax: VRFY <address>')
 
+    def test_help_auth(self):
+        with SMTP(*self.address) as client:
+            code, response = client.docmd('HELP', 'AUTH')
+            self.assertEqual(code, 250)
+            self.assertEqual(response, b'Syntax: AUTH PLAIN')
+
     def test_help_bad_arg(self):
         with SMTP(*self.address) as client:
             # Don't get tricked by smtplib processing of the response.
@@ -394,7 +417,7 @@ class TestSMTP(unittest.TestCase):
             self.assertEqual(code, 501)
             self.assertEqual(response,
                              b'Supported commands: DATA EHLO HELO HELP MAIL '
-                             b'NOOP QUIT RCPT RSET VRFY')
+                             b'NOOP QUIT RCPT RSET VRFY AUTH')
 
     def test_expn(self):
         with SMTP(*self.address) as client:
@@ -693,6 +716,245 @@ class TestSMTP(unittest.TestCase):
             self.assertEqual(
                 response,
                 b'Error: command "FOOBAR" not recognized')
+
+    def test_auth_no_ehlo(self):
+        with SMTP(*self.address) as client:
+            code, response = client.docmd('AUTH')
+            self.assertEqual(code, 503)
+            self.assertEqual(response, b'Error: send EHLO first')
+
+    def test_auth_helo(self):
+        with SMTP(*self.address) as client:
+            client.helo('example.com')
+            code, response = client.docmd('AUTH')
+            self.assertEqual(code, 500)
+            self.assertEqual(response, b"Error: command 'AUTH' not recognized")
+
+    def test_auth_too_many_values(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN NONE NONE')
+            self.assertEqual(code, 500)
+            self.assertEqual(response, b'Too many values')
+
+    def test_auth_not_enough_values(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH')
+            self.assertEqual(code, 500)
+            self.assertEqual(response, b'Not enough value')
+
+    def test_auth_not_supported_methods(self):
+        for method in ('GSSAPI', 'DIGEST-MD5', 'LOGIN', 'MD5', 'CRAM-MD5'):
+            with SMTP(*self.address) as client:
+                client.ehlo('example.com')
+                code, response = client.docmd('AUTH '+method)
+                self.assertEqual(code, 500)
+                self.assertEqual(response, b'PLAIN method or die')
+
+    def test_auth_already_authenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+            code, response = client.docmd('AUTH')
+            self.assertEqual(code, 503)
+            self.assertEqual(response, b'Already authenticated')
+
+    def test_auth_bad_base64_encoding(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN not-b64')
+            self.assertEqual(code, 501)
+            self.assertEqual(response, b"Can't decode base64")
+
+    def test_auth_bad_base64_length(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' + b64encode(b'\0onlylogin').decode())
+            self.assertEqual(code, 500)
+            self.assertEqual(response, b"Can't split auth value")
+
+    def test_auth_bad_credentials(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0badlogin\0badpasswd').decode()
+                )
+            self.assertEqual(code, 535)
+            self.assertEqual(response, b'Authentication credentials invalid')
+
+    def test_auth_two_steps_good_credentials(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN')
+            self.assertEqual(code, 334)
+            self.assertEqual(response, b'')
+            code, response = client.docmd(
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+
+    def test_auth_two_steps_bad_credentials(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN')
+            self.assertEqual(code, 334)
+            self.assertEqual(response, b'')
+            code, response = client.docmd(
+                    b64encode(b'\0badlogin\0badpasswd').decode()
+                )
+            self.assertEqual(code, 535)
+            self.assertEqual(response, b'Authentication credentials invalid')
+
+    def test_auth_two_steps_abort(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN')
+            self.assertEqual(code, 334)
+            self.assertEqual(response, b'')
+            code, response = client.docmd('*')
+            self.assertEqual(code, 501)
+            self.assertEqual(response, b'Auth aborted')
+
+    def test_auth_good_credentials(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+
+    def test_auth_no_credentials(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN =')
+            self.assertEqual(code, 535)
+            self.assertEqual(response, b'Authentication credentials invalid')
+
+    def test_auth_two_steps_no_credentials(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('AUTH PLAIN')
+            self.assertEqual(code, 334)
+            self.assertEqual(response, b'')
+            code, response = client.docmd('=')
+            self.assertEqual(code, 535)
+            self.assertEqual(response, b'Authentication credentials invalid')
+
+
+class TestRequiredAuthentication(unittest.TestCase):
+    def setUp(self):
+        controller = RequiredAuthDecodingController(Sink)
+        controller.start()
+        self.addCleanup(controller.stop)
+        self.address = (controller.hostname, controller.port)
+
+    def test_help_unauthenticated(self):
+        with SMTP(*self.address) as client:
+            code, response = client.docmd('HELP')
+            self.assertEqual(code, 530)
+            self.assertEqual(response, b'Authentication required')
+
+    def test_vrfy_unauthenticated(self):
+        with SMTP(*self.address) as client:
+            code, response = client.docmd('VRFY <anne@example.com>')
+            self.assertEqual(code, 530)
+            self.assertEqual(response, b'Authentication required')
+
+    def test_mail_unauthenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('MAIL FROM: <anne@example.com>')
+            self.assertEqual(code, 530)
+            self.assertEqual(response, b'Authentication required')
+
+    def test_rcpt_unauthenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('RCPT TO: <anne@example.com>')
+            self.assertEqual(code, 530)
+            self.assertEqual(response, b'Authentication required')
+
+    def test_data_unauthenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('DATA')
+            self.assertEqual(code, 530)
+            self.assertEqual(response, b'Authentication required')
+
+    def test_help_authenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+            code, response = client.docmd('HELP')
+            self.assertEqual(code, 250)
+            self.assertEqual(response,
+                             b'Supported commands: EHLO HELO MAIL RCPT '
+                             b'DATA RSET NOOP QUIT VRFY AUTH')
+
+    def test_vrfy_authenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+            code, response = client.docmd('VRFY <anne@example.com>')
+            self.assertEqual(code, 252)
+            self.assertEqual(
+              response,
+              b'Cannot VRFY user, but will accept message and attempt delivery'
+              )
+
+    def test_mail_authenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+            code, response = client.docmd('MAIL FROM: <anne@example.com>')
+            self.assertEqual(code, 250)
+            self.assertEqual(response, b'OK')
+
+    def test_rcpt_authenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd(
+                    'AUTH PLAIN ' +
+                    b64encode(b'\0goodlogin\0goodpasswd').decode()
+                )
+            self.assertEqual(code, 235)
+            self.assertEqual(response, b'Authentication successful')
+            code, response = client.docmd('RCPT TO: <anne@example.com>')
+            self.assertEqual(code, 503)
+            self.assertEqual(response, b'Error: need MAIL command')
+
+    def test_data_authenticated(self):
+        with SMTP(*self.address) as client:
+            client.ehlo('example.com')
+            code, response = client.docmd('DATA')
+            self.assertEqual(code, 530)
+            self.assertEqual(response, b'Authentication required')
 
 
 class TestResetCommands(unittest.TestCase):

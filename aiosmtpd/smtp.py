@@ -5,6 +5,8 @@ import logging
 import collections
 
 from asyncio import sslproto
+from base64 import b64decode
+
 from email._header_value_parser import get_addr_spec, get_angle_addr
 from email.errors import HeaderParseError
 from public import public
@@ -76,6 +78,9 @@ class SMTP(asyncio.StreamReaderProtocol):
                  tls_context=None,
                  require_starttls=False,
                  timeout=300,
+                 auth_require_tls=True,
+                 auth_method=lambda login, password: False,  # pragma: nocover
+                 auth_required=False,
                  loop=None):
         self.__ident__ = ident or __ident__
         self.loop = loop if loop else make_loop()
@@ -87,6 +92,10 @@ class SMTP(asyncio.StreamReaderProtocol):
         self.data_size_limit = data_size_limit
         self.enable_SMTPUTF8 = enable_SMTPUTF8
         self._decode_data = decode_data
+        self.auth_require_tls = auth_require_tls
+        self.auth_method = auth_method
+        self.authenticated = False
+        self.auth_required = auth_required
         self.command_size_limits.clear()
         if hostname:
             self.hostname = hostname
@@ -370,6 +379,7 @@ class SMTP(asyncio.StreamReaderProtocol):
                  DeprecationWarning)
             await self.ehlo_hook()
         status = await self._call_handler_hook('EHLO', hostname)
+        await self.push('250-AUTH PLAIN')
         if status is MISSING:
             self.session.host_name = hostname
             status = '250 HELP'
@@ -416,6 +426,62 @@ class SMTP(asyncio.StreamReaderProtocol):
         # property, if it MUST be used externally?
         self.transport = self._tls_protocol._app_transport
         self._tls_protocol.connection_made(self._original_transport)
+
+    def smtp_AUTH(self, arg):
+        if not self.session.host_name:
+            await self.push('503 Error: send EHLO first')
+            return
+        if (not self.session.extended_smtp or
+                (self.auth_require_tls and not self._tls_protocol)):
+            await self.push("500 Error: command 'AUTH' not recognized")
+            return
+        if self.authenticated:
+            await self.push('503 Already authenticated')
+            return
+        if not arg:
+            await self.push('500 Not enough value')
+            return
+        args = arg.split(' ')
+        if len(args) > 2:
+            await self.push('500 Too many values')
+            return
+        status = await self._call_handler_hook('AUTH', args)
+        if status is MISSING:
+            method = args[0]
+            if method != 'PLAIN':
+                await self.push('500 PLAIN method or die')
+                return
+            blob = None
+            if len(args) == 1:
+                await self.push('334 ')  # wait client login/password
+                line = await self._reader.readline()
+                blob = line.strip()
+                if blob.decode() == '*':
+                    await self.push("501 Auth aborted")
+                    return
+            else:
+                blob = args[1].encode()
+            log.debug('login/password %s', blob)
+            if blob == b'=':
+                login = None
+                password = None
+            else:
+                try:
+                    loginpassword = b64decode(blob, validate=True)
+                except Exception:
+                    await self.push("501 Can't decode base64")
+                    return
+                try:
+                    _, login, password = loginpassword.split(b"\x00")
+                except ValueError:  # not enough args
+                    await self.push("500 Can't split auth value")
+                    return
+            if self.auth_method(login, password):
+                self.authenticated = True
+                status = '235 Authentication successful'
+            else:
+                status = '535 Authentication credentials invalid'
+        await self.push(status)
 
     def _strip_command_keyword(self, keyword, arg):
         keylen = len(keyword)
@@ -481,6 +547,10 @@ class SMTP(asyncio.StreamReaderProtocol):
 
     @syntax('VRFY <address>')
     async def smtp_VRFY(self, arg):
+        if self.auth_required and not self.authenticated:
+            log.info('Authentication required')
+            await self.push('530 Authentication required')
+            return
         if arg:
             try:
                 address, params = self._getaddr(arg)
@@ -501,6 +571,10 @@ class SMTP(asyncio.StreamReaderProtocol):
     async def smtp_MAIL(self, arg):
         if not self.session.host_name:
             await self.push('503 Error: send HELO first')
+            return
+        if self.auth_required and not self.authenticated:
+            log.info('Authentication required')
+            await self.push('530 Authentication required')
             return
         log.debug('===> MAIL %s', arg)
         syntaxerr = '501 Syntax: MAIL FROM: <address>'
@@ -569,6 +643,10 @@ class SMTP(asyncio.StreamReaderProtocol):
         if not self.session.host_name:
             await self.push('503 Error: send HELO first')
             return
+        if self.auth_required and not self.authenticated:
+            log.info('Authentication required')
+            await self.push('530 Authentication required')
+            return
         log.debug('===> RCPT %s', arg)
         if not self.envelope.mail_from:
             await self.push('503 Error: need MAIL command')
@@ -628,6 +706,10 @@ class SMTP(asyncio.StreamReaderProtocol):
     async def smtp_DATA(self, arg):
         if not self.session.host_name:
             await self.push('503 Error: send HELO first')
+            return
+        if self.auth_required and not self.authenticated:
+            log.info('Authentication required')
+            await self.push('530 Authentication required')
             return
         if not self.envelope.rcpt_tos:
             await self.push('503 Error: need RCPT command')
